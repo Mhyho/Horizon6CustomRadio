@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FH6 电台标记编辑器</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">FH6 电台标记编辑器 <span class="ver">Marker Studio</span></div>
+  <div class="actions">
+    <label class="btn primary" title="可一次选择多首">打开音频<input id="fileInput" type="file" accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a" multiple hidden></label>
+    <label class="btn" title="导入 FH6 Radio Tool 的 Marker CSV、本工具导出的项目 JSON、或分析脚本输出的 JSON">导入<input id="importInput" type="file" accept=".csv,.json" multiple hidden></label>
+    <button class="btn" id="btnExportCsv" title="导出为 FH6 Radio Tool 可导入的 Marker CSV（包含列表中所有歌曲）">导出 CSV</button>
+    <button class="btn" id="btnExportJson" title="导出完整项目（标记 + 段落 + 节拍），可再导入继续编辑">导出项目</button>
+    <button class="btn" id="btnCopyXml" title="生成 RadioInfo XML 中的 Marker 节点">XML 片段</button>
+    <button class="btn ghost" id="btnHelp">帮助 / 快捷键</button>
+  </div>
+</header>
+
+<div class="main">
+  <aside class="sidebar">
+    <div class="panel-title">歌曲列表</div>
+    <ul id="songList" class="song-list"></ul>
+    <div class="empty-hint" id="songListEmpty">拖入音频文件，或点击「打开音频」<br><small>推荐使用 48kHz WAV（游戏使用的格式）</small></div>
+    <div class="song-meta" id="songMeta" hidden>
+      <label>显示名 <input id="metaDisplayName" type="text"></label>
+      <label>歌手 <input id="metaArtist" type="text"></label>
+      <div class="meta-info" id="metaInfo"></div>
+    </div>
+  </aside>
+
+  <section class="center">
+    <div class="transport">
+      <button class="tbtn" id="btnToStart" title="回到开头 (Home)">⏮</button>
+      <button class="tbtn big" id="btnPlay" title="播放 / 暂停 (空格)">▶</button>
+      <div class="timecode">
+        <div id="tcTime">00:00.000</div>
+        <div id="tcSamples" class="sub">0 smp</div>
+      </div>
+      <div class="sep"></div>
+      <div class="field"><span>BPM</span><input id="bpmInput" type="number" step="0.01" min="40" max="260" placeholder="—"></div>
+      <button class="btn small" id="btnSetDownbeat" title="以当前播放头为小节第一拍、用左边的 BPM 重建节拍网格">播放头 = 第一拍</button>
+      <div class="sep"></div>
+      <div class="field"><span>吸附</span>
+        <select id="snapMode">
+          <option value="off">关</option>
+          <option value="beat" selected>节拍</option>
+          <option value="bar">小节</option>
+        </select>
+      </div>
+      <label class="check" title="把标记吸附到最近的过零点，避免循环跳转时爆音"><input type="checkbox" id="snapZero" checked>过零点</label>
+      <label class="check"><input type="checkbox" id="followPlay" checked>跟随播放</label>
+      <div class="sep"></div>
+      <button class="tbtn" id="btnZoomOut" title="缩小 (-)">－</button>
+      <button class="tbtn" id="btnZoomFit" title="显示全部 (0)">全部</button>
+      <button class="tbtn" id="btnZoomIn" title="放大 (+)">＋</button>
+      <div class="sep"></div>
+      <button class="tbtn" id="btnUndo" title="撤销 (Ctrl+Z)">↶</button>
+      <button class="tbtn" id="btnRedo" title="重做 (Ctrl+Shift+Z)">↷</button>
+    </div>
+    <canvas id="overview" class="overview"></canvas>
+    <div class="timeline-wrap" id="timelineWrap">
+      <canvas id="timeline"></canvas>
+      <div class="drop-overlay" id="dropOverlay">松开以加载音频 / CSV / JSON</div>
+      <div class="tooltip" id="tooltip" hidden></div>
+    </div>
+    <div class="statusbar" id="statusbar">滚轮：平移　Ctrl+滚轮：缩放　拖动标记：移动（按住 Alt 临时关闭吸附）　S：在播放头处切分段落</div>
+  </section>
+
+  <aside class="inspector">
+    <div class="tabs">
+      <button class="tab active" data-tab="markers">标记</button>
+      <button class="tab" data-tab="sections">段落</button>
+      <button class="tab" data-tab="analysis">自动识别</button>
+    </div>
+
+    <div class="tabpane active" id="tab-markers">
+      <div class="marker-table" id="markerTable"></div>
+      <details class="adv">
+        <summary>高级标记（DJ / Stinger，默认自动）</summary>
+        <div class="marker-table" id="markerTableAdv"></div>
+      </details>
+      <div class="preview-box">
+        <div class="panel-title">试听</div>
+        <div class="btn-grid">
+          <button class="btn" data-preview="TrackLoop" title="从循环终点前 4 秒开始播放，跨过跳转点 (L)">▶ 循环衔接</button>
+          <button class="btn" data-preview="PostRaceLoop" title="从赛后循环终点前 4 秒开始播放，跨过跳转点">▶ 赛后循环衔接</button>
+          <button class="btn" data-preview="TrackDrop" title="模拟比赛开始：从 TrackDrop 开始播放">▶ 从 TrackDrop</button>
+          <button class="btn" data-preview="PostDrop" title="模拟冲线：从 PostDrop 开始播放">▶ 从 PostDrop</button>
+        </div>
+      </div>
+      <div class="validation" id="validation"></div>
+    </div>
+
+    <div class="tabpane" id="tab-sections">
+      <div class="row-btns">
+        <button class="btn" id="btnSplit" title="在播放头处切分 (S)">在播放头切分</button>
+        <button class="btn primary" id="btnDeriveMarkers" title="根据副歌 / 高潮段落自动放置 TrackDrop / Loop / PostDrop">由段落生成标记</button>
+      </div>
+      <div class="hint">点击段落轨道选中段落，右键或双击修改类型；拖动段落之间的分界线调整位置。</div>
+      <div id="sectionList" class="section-list"></div>
+    </div>
+
+    <div class="tabpane" id="tab-analysis">
+      <button class="btn primary wide" id="btnAnalyze">自动识别节拍与段落</button>
+      <label class="check"><input type="checkbox" id="optReplaceSections" checked>覆盖现有段落</label>
+      <label class="check"><input type="checkbox" id="optApplyMarkers" checked>同时生成标记（会覆盖已设置的主要标记）</label>
+      <div class="progress" id="analysisProgress" hidden><div class="bar"></div><span></span></div>
+      <div id="analysisResult" class="analysis-result"></div>
+      <div class="panel-title">循环点候选 <small>按「跳转前后听感相似度」排序</small></div>
+      <div class="row-btns">
+        <button class="btn" id="btnFindLoopsTrack">搜索 TrackLoop</button>
+        <button class="btn" id="btnFindLoopsPost">搜索赛后循环</button>
+      </div>
+      <div id="loopCandidates" class="loop-list"></div>
+      <div class="hint">
+        自动识别只是起点：识别后请试听「循环衔接」并在时间线上微调。<br>
+        需要更准确的段落标签，可以运行 <code>tools/analyze_song.py</code>，再把输出的 JSON 拖进来。
+      </div>
+    </div>
+  </aside>
+</div>
+
+<div class="ctx-menu" id="ctxMenu" hidden></div>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head"><span id="modalTitle"></span><button class="tbtn" id="modalClose">✕</button></div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<template id="helpTpl">
+  <div class="help">
+    <h3>基本流程</h3>
+    <ol>
+      <li>打开音频（推荐用 FH6 Radio Tool 处理后的 48kHz WAV，这样采样点数和游戏里完全一致）。</li>
+      <li>在「自动识别」页点击识别，得到节拍网格、段落和一套建议标记。</li>
+      <li>在时间线上拖动标记微调，用「试听 → 循环衔接」检查跳转是否顺滑。</li>
+      <li>导出 CSV，在 FH6 Radio Tool 的 Marker Import 中导入；或复制 XML 片段手动粘贴。</li>
+    </ol>
+    <h3>标记含义</h3>
+    <table class="kv">
+      <tr><td>TrackDrop</td><td>比赛开始时切入的高潮位置（通常是第一段副歌 / Drop）</td></tr>
+      <tr><td>TrackLoopStart / End</td><td>普通播放 / 比赛中的循环段，播到 End 跳回 Start</td></tr>
+      <tr><td>PostDrop</td><td>冲线 / 赛后切入的高潮位置</td></tr>
+      <tr><td>PostRaceLoopStart / End</td><td>赛后循环段</td></tr>
+      <tr><td>DJ / Stinger</td><td>DJ 语音与转场，留空即「自动」，由 FH6 Radio Tool 推导</td></tr>
+    </table>
+    <h3>快捷键</h3>
+    <table class="kv">
+      <tr><td>空格</td><td>播放 / 暂停</td></tr>
+      <tr><td>Home / End</td><td>跳到开头 / 结尾</td></tr>
+      <tr><td>← / →</td><td>播放头移动一拍（无网格时 0.5 秒）；Shift：一小节</td></tr>
+      <tr><td>1 – 6</td><td>把 TrackDrop、TrackLoopStart、TrackLoopEnd、PostDrop、PostRaceLoopStart、PostRaceLoopEnd 放到播放头</td></tr>
+      <tr><td>[ / ]</td><td>选中的标记左移 / 右移一拍；Alt：±10 采样点</td></tr>
+      <tr><td>Delete</td><td>清除选中标记 / 删除选中的段落分界</td></tr>
+      <tr><td>S</td><td>在播放头处切分段落</td></tr>
+      <tr><td>L</td><td>试听 TrackLoop 衔接</td></tr>
+      <tr><td>Ctrl+Z / Ctrl+Shift+Z</td><td>撤销 / 重做</td></tr>
+      <tr><td>Ctrl+滚轮、+ / -、0</td><td>缩放 / 显示全部</td></tr>
+      <tr><td>滚轮、Shift+滚轮</td><td>水平平移</td></tr>
+    </table>
+    <h3>关于采样点</h3>
+    <p>所有位置都以「采样点」保存。打开非 48kHz 或压缩格式（MP3 等）时，音频会被重采样到 48kHz 后再计算位置；
+       这时位置与最终 WAV 可能有几毫秒误差，FH6 Radio Tool 会按 SampleLength 等比例换算。
+       追求精确请直接打开最终的 48kHz WAV。</p>
+  </div>
+</template>
+
+<script src="analysis.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+node_modules/
+*.wav
+*.analysis.json
+*.truth.json
