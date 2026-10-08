@@ -95,7 +95,7 @@ if (mode === 'synth') {
     };
     const dc = chorusStarts(r.sections);
     if (truth.choruses.length) {
-      const tc = truth.choruses.filter((s, i, a) => i === 0 || s !== a[i - 1]);
+      const tc = truth.choruses;
       const errBars = (d, t) => (d == null ? 16 : Math.min(16, Math.abs(d - t) / barLen));
       row.chorusFirst = errBars(dc[0], tc[0]);
       row.chorusLast = errBars(dc[dc.length - 1], tc[tc.length - 1]);

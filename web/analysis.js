@@ -523,7 +523,21 @@ function HRAnalysisModule() {
       }
       k = best;
     }
-    for (const kk of ks) res.scores[kk] = sc[kk].d;
+    if (!fixed && k === 4 && bpm >= 125) {
+      // 跟踪到了八分音符层级的慢歌：4 拍位相上，隔一个的和声变化明显弱 → 真实的一小节是 8 个脉冲
+      const p4 = sc[4].p;
+      let ma = 0, ca = 0, mb = 0, cb = 0;
+      for (const i of idx) {
+        const r = ((i - p4) % 8 + 8) % 8;
+        if (r === 0) { ma += nv.chg[i]; ca++; } else if (r === 4) { mb += nv.chg[i]; cb++; }
+      }
+      ma /= Math.max(1, ca); mb /= Math.max(1, cb);
+      res.chordRatio = Math.min(ma, mb) / (Math.max(ma, mb) || 1);
+      const d8 = contrast(8);
+      sc[8] = d8;
+      if (res.chordRatio < 0.45 && d8.d > 1.05 * sc[4].d) k = 8;
+    }
+    for (const kk of Object.keys(sc)) res.scores[kk] = sc[kk].d;
     res.beatsPerBar = k;
     res.phase = sc[k].p;
     return res;
@@ -532,15 +546,17 @@ function HRAnalysisModule() {
   /** 每小节的特征向量：12 维 chroma + 12 维音色（对数频带 DCT）+ 响度 */
   function barFeatures(F, bars, length) {
     const NB = F.NB, feats = [], energy = [];
+    const full = [], bright = [], dens = [], low = [];
     for (let i = 0; i < bars.length; i++) {
       const a = bars[i], b = i + 1 < bars.length ? bars[i + 1] : length;
       const fa = frameOfSample(F, a), fb = Math.max(fa + 1, frameOfSample(F, b));
-      const chroma = new Float64Array(12), band = new Float64Array(NB);
-      let e = 0;
+      const chroma = new Float64Array(12), band = new Float64Array(NB), bandLin = new Float64Array(NB);
+      let e = 0, od = 0;
       for (let f = fa; f < fb; f++) {
         for (let c = 0; c < 12; c++) chroma[c] += F.chroma[f * 12 + c];
-        for (let k = 0; k < NB; k++) band[k] += F.bands[f * NB + k];
+        for (let k = 0; k < NB; k++) { band[k] += F.bands[f * NB + k]; bandLin[k] += Math.pow(10, F.bands[f * NB + k] / 10); }
         e += Math.pow(10, F.rms[f] / 10);
+        od += F.onset[f];
       }
       const cnt = fb - fa;
       let cn = 0;
@@ -555,6 +571,13 @@ function HRAnalysisModule() {
       }
       feats.push([...Array.from(chroma, (v) => v / cn), ...mfcc]);
       energy.push(10 * Math.log10(e / cnt + 1e-10));
+      // 听感描述量：谱的「满度」（各频带 dB 的平均）、亮度（谱质心）、起音密度、低频占比
+      let fl = 0, tot = 0, cen = 0, lw = 0;
+      for (let k = 0; k < NB; k++) { fl += Math.max(-70, band[k]); tot += bandLin[k]; cen += k * bandLin[k]; if (k < 6) lw += bandLin[k]; }
+      full.push(fl / NB);
+      bright.push(tot > 0 ? cen / tot / NB : 0);
+      low.push(tot > 0 ? lw / tot : 0);
+      dens.push(od / cnt);
     }
     // 维度标准化
     const D = feats.length ? feats[0].length : 0;
@@ -563,7 +586,7 @@ function HRAnalysisModule() {
       const m = mean(col), s = std(col) || 1;
       for (const f of feats) f[d] = (f[d] - m) / s;
     }
-    return { feats, energy };
+    return { feats, energy, full, bright, dens, low };
   }
 
   // ---------------------------------------------------------------- 段落分割
@@ -621,62 +644,140 @@ function HRAnalysisModule() {
   }
 
   // ---------------------------------------------------------------- 段落标签
-  function labelSegments(segBars, feats, energy) {
+  /**
+   * 段落标签。副歌 = 「会重复出现、和声接近、听感更满更亮更密」的那一类段落，响度只是其中一项，
+   * 所以压缩过度的母带（副歌不比主歌响）和 EDM（drop 比铺垫轻）也能识别。
+   * extra: barFeatures 给出的每小节描述量 {full, bright, dens, low}。
+   */
+  function labelSegments(segBars, feats, energy, extra) {
     const n = feats.length;
     const segs = segBars.map((s, k) => ({ a: s, b: k + 1 < segBars.length ? segBars[k + 1] : n }));
+    const D = feats[0].length;
     for (const sg of segs) {
-      const D = feats[0].length, v = new Float64Array(D);
+      const v = new Float64Array(D), len = sg.b - sg.a;
       for (let i = sg.a; i < sg.b; i++) for (let d = 0; d < D; d++) v[d] += feats[i][d];
-      sg.vec = Array.from(v, (x) => x / (sg.b - sg.a));
-      // 用线性能量平均再转 dB
+      sg.vec = Array.from(v, (x) => x / len);
       let e = 0;
       for (let i = sg.a; i < sg.b; i++) e += Math.pow(10, energy[i] / 10);
-      sg.energy = 10 * Math.log10(e / (sg.b - sg.a));
+      sg.energy = 10 * Math.log10(e / len);
+      sg.full = extra ? mean(extra.full, sg.a, sg.b) : 0;
+      sg.bright = extra ? mean(extra.bright, sg.a, sg.b) : 0;
+      sg.dens = extra ? mean(extra.dens, sg.a, sg.b) : 0;
+      sg.low = extra ? mean(extra.low, sg.a, sg.b) : 0;
       sg.label = 'verse';
     }
     const m = segs.length;
     if (m === 1) { segs[0].label = 'chorus'; return segs; }
 
-    // 相似段落聚类（简单并查集）
-    const parent = segs.map((_, i) => i);
-    const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
-    for (let i = 0; i < m; i++) for (let j = i + 1; j < m; j++) {
-      if (cosine(segs[i].vec, segs[j].vec) > 0.55) parent[find(i)] = find(j);
+    // 段落两两相似度：按小节逐一对齐比较（比整段平均向量更能区分「同和声、不同编排」）
+    const barSim = (x, y) => {
+      const L = Math.min(x.b - x.a, y.b - y.a);
+      let s = 0;
+      for (let i = 0; i < L; i++) s += cosine(feats[x.a + i], feats[y.a + i]);
+      return L ? s / L : 0;
+    };
+    const sim = segs.map((x, i) => segs.map((y, j) => (i === j ? 1 : Math.max(barSim(x, y), 0.5 * cosine(x.vec, y.vec) + 0.5 * barSim(x, y)))));
+    // 平均连接的层次聚类，阈值 0.5
+    let groups = segs.map((_, i) => [i]);
+    for (;;) {
+      let bi = -1, bj = -1, bs = 0.5;
+      for (let i = 0; i < groups.length; i++) for (let j = i + 1; j < groups.length; j++) {
+        let s = 0;
+        for (const x of groups[i]) for (const y of groups[j]) s += sim[x][y];
+        s /= groups[i].length * groups[j].length;
+        if (s > bs) { bs = s; bi = i; bj = j; }
+      }
+      if (bi < 0) break;
+      groups[bi] = groups[bi].concat(groups[bj]);
+      groups.splice(bj, 1);
     }
-    const clusters = new Map();
-    segs.forEach((s, i) => { const r = find(i); if (!clusters.has(r)) clusters.set(r, []); clusters.get(r).push(i); });
 
-    const energies = segs.map((s) => s.energy);
-    const maxE = Math.max(...energies), minE = Math.min(...energies);
-    const medE = median(energies);
-    const rel = (e) => (maxE - minE > 0.1 ? (e - minE) / (maxE - minE) : 1);
-
-    let bestC = null, bestScore = -Infinity;
-    for (const [, members] of clusters) {
-      const ce = mean(members.map((i) => rel(segs[i].energy)));
-      const bars = members.reduce((t, i) => t + segs[i].b - segs[i].a, 0);
-      const score = ce * 1.6 + (members.length >= 2 ? 0.35 : 0) + Math.min(0.3, 0.05 * members.length) + Math.min(0.2, bars / n);
-      if (score > bestScore) { bestScore = score; bestC = members; }
+    // 段落描述量标准化（按时长加权的 z 分数），响度只占一部分
+    const wts = segs.map((s) => s.b - s.a), wsum = wts.reduce((a, b) => a + b, 0);
+    const zscore = (key) => {
+      const mu = segs.reduce((t, s, i) => t + s[key] * wts[i], 0) / wsum;
+      const sd = Math.sqrt(segs.reduce((t, s, i) => t + (s[key] - mu) * (s[key] - mu) * wts[i], 0) / wsum) || 1;
+      segs.forEach((s) => { s['z_' + key] = (s[key] - mu) / sd; });
+    };
+    ['energy', 'full', 'bright', 'dens', 'low'].forEach(zscore);
+    for (const s of segs) {
+      s.hi = 0.35 * s.z_energy + 0.55 * s.z_full + 0.3 * s.z_bright + 0.4 * s.z_dens + 0.2 * s.z_low;
     }
-    const chorusE = mean(bestC.map((i) => segs[i].energy));
-    for (const i of bestC) segs[i].label = 'chorus';
-    for (const s of segs) if (s.label !== 'chorus' && s.energy >= chorusE - 0.8 && s.energy >= medE) s.label = 'chorus';
 
+    // 铺垫（build-up）特征：短、段内响度 / 起音密度持续上升。它们常常很响很亮，但不是副歌；
+    // 紧跟在这类段落之后、而且更长的那一类，才是副歌 / drop。
+    const slope = (arr, a, b) => {
+      const L = b - a;
+      if (L < 3) return 0;
+      const mi = (L - 1) / 2, mv = mean(arr, a, b);
+      let sxx = 0, sxy = 0;
+      for (let q = 0; q < L; q++) { sxx += (q - mi) * (q - mi); sxy += (q - mi) * (arr[a + q] - mv); }
+      return sxy / sxx;
+    };
+    const dens = extra ? extra.dens : null;
+    for (const s of segs) {
+      const L = s.b - s.a;
+      s.rising = L <= 12 && (slope(energy, s.a, s.b) > 0.3 || (dens && slope(dens, s.a, s.b) > 0.05));
+    }
+    const groupOf = new Array(m);
+    groups.forEach((g, gi) => g.forEach((i) => { groupOf[i] = gi; }));
+    const buildGroup = groups.map((g) => g.filter((i) => segs[i].rising).length >= 0.6 * g.length && g.every((i) => i + 1 < m));
+    const succBonus = new Array(groups.length).fill(0);
+    groups.forEach((g, gi) => {
+      if (!buildGroup[gi]) return;
+      const nx = new Set(g.map((i) => groupOf[i + 1]));
+      if (nx.size !== 1) return;
+      const h = [...nx][0];
+      if (h !== gi && groups[h].length >= 1 && mean(groups[h].map((i) => segs[i].b - segs[i].a)) > mean(g.map((i) => segs[i].b - segs[i].a))) succBonus[h] += 1.0;
+    });
+
+    let bestG = null, bestScore = -Infinity;
+    groups.forEach((g, gi) => {
+      const bars = g.reduce((t, i) => t + segs[i].b - segs[i].a, 0);
+      const hi = g.reduce((t, i) => t + segs[i].hi * (segs[i].b - segs[i].a), 0) / bars;
+      let near = 0, pc = 0;
+      for (let x = 0; x < g.length; x++) for (let y = x + 1; y < g.length; y++) { near += sim[g[x]][g[y]]; pc++; }
+      near = pc ? near / pc : 0;
+      const avgLen = bars / g.length;
+      let score = hi
+        + (g.length >= 2 ? 0.8 + 0.8 * Math.max(0, near - 0.5) : 0)
+        + 0.12 * Math.min(g.length, 4)
+        + Math.min(0.5, bars / n * 1.5)
+        + succBonus[gi]
+        - (buildGroup[gi] ? 2.0 : 0)
+        - (avgLen < 4 ? 0.6 : 0)
+        - (g.includes(0) && g.length === 1 ? 0.8 : 0);       // 只出现一次、又在开头：多半是前奏
+      if (g.every((i) => i === 0 || i === m - 1) && g.length === 1) score -= 0.5;
+      if (score > bestScore) { bestScore = score; bestG = g; }
+    });
+    for (const i of bestG) segs[i].label = 'chorus';
+    // 与副歌原型高度相似、且不低于副歌水平的其它段，也算副歌（变奏 / 尾部重复）
+    const proto = new Array(D).fill(0);
+    let pw = 0;
+    for (const i of bestG) { const w = segs[i].b - segs[i].a; segs[i].vec.forEach((v, d) => { proto[d] += v * w; }); pw += w; }
+    for (let d = 0; d < D; d++) proto[d] /= pw;
+    const chorusHi = mean(bestG.map((i) => segs[i].hi));
+    for (const s of segs) {
+      if (s.label !== 'chorus' && cosine(s.vec, proto) > 0.8 && s.hi >= chorusHi - 0.3) s.label = 'chorus';
+    }
+
+    const energies = segs.map((s) => s.energy), medE = median(energies);
     const first = segs[0], last = segs[m - 1];
-    if (first.label !== 'chorus' && (first.energy < medE - 1 || first.b - first.a <= 8)) first.label = 'intro';
-    if (last.label !== 'chorus' && m > 2 && (last.energy < segs[m - 2].energy - 1.5 || last.energy < medE - 2)) last.label = 'outro';
+    if (first.label !== 'chorus' && (first.hi < 0 || first.b - first.a <= 8)) first.label = 'intro';
+    if (last.label !== 'chorus' && m > 2 && (last.energy < segs[m - 2].energy - 1.5 || last.energy < medE - 2 || last.hi < segs[m - 2].hi - 0.4)) last.label = 'outro';
 
     const firstChorus = segs.findIndex((s) => s.label === 'chorus');
     for (let i = 1; i < m - 1; i++) {
       const s = segs[i];
       if (s.label !== 'verse') continue;
-      // 铺垫段：紧挨副歌之前、较短、且能量在段内上升
+      // 铺垫段：紧挨副歌之前、较短、且能量或密度在段内上升
       const half = Math.max(1, (s.b - s.a) >> 1);
       const rise = mean(energy, s.a + half, s.b) - mean(energy, s.a, s.a + half);
-      const quiet = s.energy < medE - 2.5;
-      if (segs[i + 1].label === 'chorus' && s.b - s.a <= 8 && (rise > 1 || !quiet)) s.label = 'build';
-      else if (firstChorus >= 0 && i > firstChorus && quiet) s.label = 'bridge';
+      const riseD = extra ? mean(extra.dens, s.a + half, s.b) - mean(extra.dens, s.a, s.a + half) : 0;
+      if (segs[i + 1].label === 'chorus' && s.b - s.a <= 8 && (rise > 1 || riseD > 0.15 || s.rising)) s.label = 'build';
+      else if (firstChorus >= 0 && i > firstChorus && s.hi < -0.3 && groups.every((g) => !(g.includes(i) && g.length > 1))) s.label = 'bridge';
     }
+    refineChorusStarts(segs, feats, proto);
 
     // 合并相邻同标签段
     const merged = [];
@@ -689,6 +790,30 @@ function HRAnalysisModule() {
       } else merged.push({ a: s.a, b: s.b, label: s.label, energy: s.energy });
     }
     return merged;
+  }
+
+  /**
+   * 副歌起点微调：在 ±2 小节内选一个边界，使「边界之后 4 小节更像副歌原型、之前 4 小节更不像」。
+   * 起点（TrackDrop / PostDrop）必须落在正确的小节上，所以只动「非副歌 → 副歌」的边界。
+   */
+  function refineChorusStarts(segs, feats, proto) {
+    const n = feats.length;
+    const simTo = (i) => (i >= 0 && i < n ? cosine(feats[i], proto) : null);
+    for (let k = 1; k < segs.length; k++) {
+      if (segs[k].label !== 'chorus' || segs[k - 1].label === 'chorus') continue;
+      const cur = segs[k].a;
+      let best = -Infinity, bb = cur;
+      for (let d = -2; d <= 2; d++) {
+        const b = cur + d;
+        if (b - segs[k - 1].a < 2 || segs[k].b - b < 4) continue;
+        let after = 0, ac = 0, before = 0, bc = 0;
+        for (let j = 0; j < 4; j++) { const v = simTo(b + j); if (v != null) { after += v; ac++; } }
+        for (let j = 1; j <= 4; j++) { const v = simTo(b - j); if (v != null) { before += v; bc++; } }
+        const sc = (ac ? after / ac : 0) - (bc ? before / bc : 0) - 0.03 * Math.abs(d);
+        if (sc > best) { best = sc; bb = b; }
+      }
+      if (bb !== cur) { segs[k].a = bb; segs[k - 1].b = bb; }
+    }
   }
 
   // ---------------------------------------------------------------- Marker 推导
@@ -854,7 +979,7 @@ function HRAnalysisModule() {
     const bf = barFeatures(F, bars, length);
     const segBars = segmentBars(bf.feats, bf.energy, { phraseOffset: bars[0] === 0 && downbeats[0] !== 0 ? 1 : 0 });
     progress && progress(0.9, '段落标注');
-    const labeled = labelSegments(segBars, bf.feats, bf.energy);
+    const labeled = labelSegments(segBars, bf.feats, bf.energy, bf);
     const sections = labeled.map((s) => ({
       start: s.a === 0 ? 0 : bars[s.a],
       end: s.b >= bars.length ? length : bars[s.b],
@@ -868,7 +993,7 @@ function HRAnalysisModule() {
     return {
       sampleRate: sr, length, bpm, constantTempo,
       grid: grid ? { t0: grid.t0, period: grid.period } : null,
-      beats, downbeats, beatsPerBar, bars, metreScores: metre.scores,
+      beats, downbeats, beatsPerBar, bars, metreScores: metre.scores, chordRatio: metre.chordRatio,
       barFeats: bf.feats, barEnergy: bf.energy,
       sections, markers, loopsTrack, loopsPost,
     };

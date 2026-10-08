@@ -43,6 +43,8 @@ S_FADE = [("intro", 8), ("verse", 16), ("build", 8), ("chorus", 16), ("verse", 1
           ("build", 8), ("chorus", 16), ("chorus", 16)]
 S_EDM = [("intro", 8), ("build", 8), ("drop", 16), ("bridge", 8), ("build", 8), ("drop", 16),
          ("bridge", 8), ("build", 8), ("drop", 16), ("outro", 8)]
+S_V3 = [("intro", 8), ("verse", 16), ("build", 8), ("chorus", 16), ("verse", 16), ("verse", 16),
+        ("build", 8), ("chorus", 16), ("outro", 8)]
 S_NOCH = [("part0", 8), ("part1", 8), ("part2", 8), ("part3", 8), ("part4", 8), ("part5", 8), ("part6", 8)]
 
 CASES = {
@@ -61,6 +63,8 @@ CASES = {
     'compressed126': dict(bpm=126, S=S4, compress=True),
     'edm128':   dict(bpm=128, S=S_EDM, edm=True),
     'nochorus120': dict(bpm=120, S=S_NOCH, nochorus=True),
+    'quietchorus116': dict(bpm=116, S=S4, chorus_gain=0.5),
+    'verse3comp122': dict(bpm=122, S=S_V3, compress=True),
 }
 
 _rng = np.random.default_rng(7)
@@ -240,15 +244,17 @@ def render(name, case, outdir):
                 for k in range(dens):
                     add(snare(), bt(gb + k * bpb / dens), 0.3 + 0.05 * b)
             elif label == 'chorus':
-                add(tone([midi(m + 12) for m in ch], bar_len, 0.3, saw=True), tb)
+                cg = case.get('chorus_gain', 1.0)   # <1：副歌比主歌更轻（但和弦更厚、有 hat）
+                add(tone([midi(m + 12) for m in ch], bar_len, 0.3 * cg, saw=True), tb)
+                add(tone([midi(m) for m in ch], bar_len, 0.15 * cg, saw=True), tb)
                 for p in kicks:
-                    add(kick(), bt(gb + p), 1.0)
+                    add(kick(), bt(gb + p), 1.0 * cg)
                 for k in range(bpb):
-                    add(tone([midi(ch[0] - 24)], beat_len * 0.9, 0.5, saw=True), bt(gb + k))
+                    add(tone([midi(ch[0] - 24)], beat_len * 0.9, 0.5 * cg, saw=True), bt(gb + k))
                 for p in snares:
-                    add(snare(), bt(gb + p), 0.8)
+                    add(snare(), bt(gb + p), 0.8 * cg)
                 for p in sub_times():
-                    add(hat(), bt(gb + p), 1.0)
+                    add(hat(), bt(gb + p), 1.0 * cg)
         barno += nbars
 
     # 前奏拍（pickup）：弱起音符，只有 pickup 区间内的小鼓 / 短音
@@ -300,7 +306,10 @@ def render(name, case, outdir):
         w.setframerate(SR)
         w.writeframes(pcm.tobytes())
     ioi = np.diff(beats)
-    chorus_starts = [s['start'] for s in sections if s['label'] in ('chorus', 'drop')]
+    chorus_starts = []   # 连续的副歌 / drop 只算一段，取起点
+    for i, s in enumerate(sections):
+        if s['label'] in ('chorus', 'drop') and (i == 0 or sections[i - 1]['label'] not in ('chorus', 'drop')):
+            chorus_starts.append(s['start'])
     truth = {
         "name": name, "sr": SR, "length": int(N), "bpm": float(60 * SR / np.median(ioi)),
         "beatsPerBar": bpb, "beats": beats, "downbeats": downbeats, "sections": sections,
