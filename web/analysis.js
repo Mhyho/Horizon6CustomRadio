@@ -190,37 +190,109 @@ function HRAnalysisModule() {
   }
 
   // ---------------------------------------------------------------- 速度 / 节拍
-  function estimateTempo(onset, fps) {
-    const minLag = Math.floor(fps * 60 / 220), maxLag = Math.ceil(fps * 60 / 55);
-    const n = onset.length;
-    const ac = new Float64Array(maxLag + 2);
-    for (let lag = minLag - 1; lag <= maxLag + 1; lag++) {
+  function gaussSmooth(x, sigma) {
+    const rad = Math.max(1, Math.ceil(sigma * 3)), k = new Float32Array(2 * rad + 1);
+    let ks = 0;
+    for (let i = -rad; i <= rad; i++) { k[i + rad] = Math.exp(-0.5 * (i / sigma) * (i / sigma)); ks += k[i + rad]; }
+    const n = x.length, out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
       let s = 0;
-      for (let i = lag; i < n; i++) s += onset[i] * onset[i - lag];
-      ac[lag] = s / (n - lag);
+      for (let j = -rad; j <= rad; j++) { const q = i + j; if (q >= 0 && q < n) s += x[q] * k[j + rad]; }
+      out[i] = s / ks;
     }
-    let best = -1, bestLag = minLag;
-    for (let lag = minLag; lag <= maxLag; lag++) {
-      const bpm = 60 * fps / lag;
-      const w = Math.exp(-0.5 * Math.pow(Math.log2(bpm / 120) / 0.9, 2));
-      // 同时考虑二倍 lag（半速）的支持，减少八度错误
-      const support = lag * 2 <= maxLag ? 0.5 * ac[lag * 2] : 0;
-      const s = (ac[lag] + support) * w;
-      if (s > best) { best = s; bestLag = lag; }
-    }
-    const a = ac[bestLag - 1], b = ac[bestLag], c = ac[bestLag + 1];
-    const denom = a - 2 * b + c;
-    const delta = denom !== 0 ? 0.5 * (a - c) / denom : 0;
-    const lag = bestLag + Math.max(-0.5, Math.min(0.5, delta));
-    return 60 * fps / lag;
+    return out;
   }
 
-  /** Ellis 动态规划节拍跟踪 */
-  function trackBeats(onset, fps, bpm) {
+  function interp(a, t) {
+    const i = Math.floor(t), f = t - i;
+    if (i < 0 || i + 1 >= a.length) return 0;
+    return a[i] * (1 - f) + a[i + 1] * f;
+  }
+
+  /**
+   * 速度候选：对每个候选速度，把一条等间隔的拍网格放到起音包络上，在每个 ~10 秒窗口里取最佳相位，
+   * 累加「网格上的起音强度 - 背景」。这样网格必须同时解释强拍和弱拍（二倍速要求半拍位置也有起音，
+   * 半速则会漏掉奇数拍），比单个自相关峰更不容易出八度错误；窗口内各自取相位，也容忍速度漂移。
+   * 返回 [{bpm, score}]（已叠加弱先验）。
+   */
+  function tempoCandidates(onset, fps, opts = {}) {
     const n = onset.length;
-    const period = fps * 60 / bpm;
-    // 高斯平滑的局部得分
-    const sigma = Math.max(1, period / 32), rad = Math.ceil(sigma * 3);
+    const o = gaussSmooth(onset, 1.0);
+    const bg = mean(o) * (opts.bg == null ? 1.0 : opts.bg);
+    const winN = Math.max(Math.round(fps * 10), 64), hopW = winN >> 1;
+    const sigma = opts.priorSigma || 0.8;
+    const out = [];
+    for (let bpm = 55; bpm <= 220; bpm += 0.5) {
+      const L = fps * 60 / bpm;
+      let total = 0;
+      for (let s = 0; s + winN <= n || s === 0; s += hopW) {
+        const e = Math.min(n - 1, s + winN);
+        let best = -Infinity;
+        for (let ph = 0; ph < L; ph += 0.5) {
+          let acc = 0;
+          for (let t = s + ph; t < e; t += L) acc += interp(o, t) - bg;
+          if (acc > best) best = acc;
+        }
+        total += best;
+        if (s + winN >= n) break;
+      }
+      out.push({ bpm, raw: total, score: total * Math.exp(-0.5 * Math.pow(Math.log2(bpm / 120) / sigma, 2)) });
+    }
+    return out;
+  }
+
+  function estimateTempo(onset, fps) {
+    const c = tempoCandidates(onset, fps);
+    let bi = 0;
+    for (let i = 1; i < c.length; i++) if (c[i].score > c[bi].score) bi = i;
+    return c[bi].bpm;
+  }
+
+  /**
+   * 局部速度：在 ~12 秒窗口内、全局速度 ±25% 范围里找网格得分最高的速度，窗口每 3 秒滑动一次，
+   * 再做中值平滑。用来给节拍跟踪提供随时间变化的期望拍长（帧 / 拍），应对漂移和变速。
+   */
+  function localPeriods(o, fps, bpm0) {
+    const n = o.length, os = gaussSmooth(o, 1.0), bg = mean(os);
+    const winN = Math.round(fps * 12), hopW = Math.round(fps * 3);
+    const pts = [];
+    for (let s = 0; s === 0 || s + winN <= n; s += hopW) {
+      const e = Math.min(n - 1, s + winN);
+      let best = -Infinity, bb = bpm0;
+      for (let r = -0.25; r <= 0.25001; r += 0.005) {
+        const bpm = bpm0 * Math.exp(r * 0.9);
+        const L = fps * 60 / bpm;
+        let top = -Infinity;
+        for (let ph = 0; ph < L; ph += 0.5) {
+          let acc = 0;
+          for (let t = s + ph; t < e; t += L) acc += interp(os, t) - bg;
+          if (acc > top) top = acc;
+        }
+        top *= Math.exp(-0.5 * Math.pow(Math.log(bpm / bpm0) / 0.12, 2));
+        if (top > best) { best = top; bb = bpm; }
+      }
+      pts.push({ c: Math.min(n - 1, s + winN / 2), bpm: bb });
+      if (s + winN >= n) break;
+    }
+    const sm = pts.map((_, i) => median(pts.slice(Math.max(0, i - 2), i + 3).map((p) => p.bpm)));
+    const per = new Float32Array(n);
+    for (let t = 0; t < n; t++) {
+      let k = 0;
+      while (k + 1 < pts.length && pts[k + 1].c <= t) k++;
+      let bpm;
+      if (k + 1 >= pts.length || t <= pts[0].c) bpm = sm[Math.min(k, sm.length - 1)];
+      else { const f = (t - pts[k].c) / (pts[k + 1].c - pts[k].c); bpm = sm[k] * (1 - f) + sm[k + 1] * f; }
+      per[t] = fps * 60 / bpm;
+    }
+    return per;
+  }
+
+  /** Ellis 动态规划节拍跟踪；per 为数字（帧 / 拍）或每帧的期望拍长数组 */
+  function trackBeats(onset, fps, per) {
+    const n = onset.length;
+    const perAt = typeof per === 'number' ? () => per : (t) => per[t];
+    const p0 = perAt(Math.floor(n / 2));
+    const sigma = Math.max(1, p0 / 32), rad = Math.ceil(sigma * 3);
     const local = new Float32Array(n);
     for (let i = 0; i < n; i++) {
       let s = 0;
@@ -232,8 +304,9 @@ function HRAnalysisModule() {
     }
     const cum = new Float32Array(n), back = new Int32Array(n).fill(-1);
     const tight = 100;
-    const lo = Math.round(period / 2), hi = Math.round(period * 2);
     for (let t = 0; t < n; t++) {
+      const period = perAt(t);
+      const lo = Math.round(period / 2), hi = Math.round(period * 2);
       let best = -Infinity, bi = -1;
       for (let p = t - hi; p <= t - lo; p++) {
         if (p < 0) continue;
@@ -245,7 +318,7 @@ function HRAnalysisModule() {
       back[t] = bi >= 0 && best > 0 ? bi : -1;
     }
     let end = n - 1, bestEnd = -Infinity;
-    for (let t = Math.max(0, n - Math.round(period * 1.5)); t < n; t++) if (cum[t] > bestEnd) { bestEnd = cum[t]; end = t; }
+    for (let t = Math.max(0, n - Math.round(p0 * 1.5)); t < n; t++) if (cum[t] > bestEnd) { bestEnd = cum[t]; end = t; }
     const beats = [];
     for (let t = end; t >= 0; t = back[t]) { beats.push(t); if (back[t] < 0) break; }
     beats.reverse();
@@ -253,7 +326,55 @@ function HRAnalysisModule() {
     const thr = 0.3 * mean(Array.from(beats, (b) => local[b]));
     while (beats.length && local[beats[0]] < thr) beats.shift();
     while (beats.length && local[beats[beats.length - 1]] < thr) beats.pop();
-    return { beats, period };
+    return { beats, period: p0 };
+  }
+
+  /**
+   * 在全局速度附近（±2%）整体搜索「周期 + 相位」：一条恒速网格在整首歌上的起音得分最高者。
+   * 整首歌共用一个相位，因此即使某些段落（鼓组缺席、反拍低音很响）局部相位有歧义，也不会被带偏。
+   * 返回帧单位的 {L, ph}。
+   */
+  function searchGlobalGrid(o, fps, bpm0) {
+    const os = gaussSmooth(o, 1.0), bg = mean(os), n = os.length;
+    const L0 = fps * 60 / bpm0;
+    let best = -Infinity, res = { L: L0, ph: 0 };
+    for (let r = -0.02; r <= 0.02001; r += 0.0005) {
+      const L = L0 * (1 + r);
+      for (let ph = 0; ph < L; ph += 0.5) {
+        let acc = 0;
+        for (let t = ph; t < n - 1; t += L) acc += interp(os, t) - bg;
+        if (acc > best) { best = acc; res = { L, ph }; }
+      }
+    }
+    return res;
+  }
+
+  /**
+   * 检验恒速网格：在每个网格拍点 ±40ms 内找高分辨率起音包络的峰，统计相对整体偏移的离散程度。
+   * 漂移 / 变速的歌，网格会逐渐偏离起音，p80 偏差会明显变大。返回 {ok, spread, used}。
+   */
+  function verifyGrid(beatSamples, fine, sr) {
+    const win = Math.round(0.04 * sr / fine.hop);
+    let thr = 0;
+    {
+      const sorted = Array.from(fine.env).sort((a, b) => a - b);
+      thr = Math.max(1.5, sorted[Math.floor(sorted.length * 0.9)]);
+    }
+    const devs = [];
+    for (const b of beatSamples) {
+      const f0 = Math.round((b - fine.win + fine.hop / 2) / fine.hop);
+      let bv = 0, bf = -1;
+      for (let f = f0 - win; f <= f0 + win; f++) {
+        if (f < 0 || f >= fine.env.length) continue;
+        if (fine.env[f] > bv) { bv = fine.env[f]; bf = f; }
+      }
+      if (bf >= 0 && bv >= thr) devs.push((fine.toSample(bf) - b) / sr * 1000);
+    }
+    if (devs.length < 16 || devs.length < 0.25 * beatSamples.length) return { ok: false, spread: Infinity, used: devs.length };
+    const m = median(devs);
+    const ad = devs.map((d) => Math.abs(d - m)).sort((a, b) => a - b);
+    const spread = ad[Math.floor(ad.length * 0.8)];
+    return { ok: spread <= 15, spread, used: devs.length };
   }
 
   /** 线性回归拟合恒定速度网格，返回 {t0, period, residualStd} （单位：采样点） */
@@ -324,37 +445,88 @@ function HRAnalysisModule() {
     return Math.max(0, Math.min(F.nFrames - 1, Math.round((s / F.decim - F.nfft / 2 + F.hop / 2) / F.hop)));
   }
 
-  function chooseDownbeatPhase(F, beats, beatsPerBar) {
+  /** 每拍的「强拍倾向」特征：低频起音、和声变化、响度跳变（只统计有声的拍） */
+  function beatSyncNovelty(F, beats) {
     const nb = beats.length;
-    if (nb < beatsPerBar * 4) return 0;
-    // 每拍的低频起音强度 + 和声变化
-    const low = new Float32Array(nb), chg = new Float32Array(nb);
+    const low = new Float32Array(nb), chg = new Float32Array(nb), eng = new Float32Array(nb), active = new Uint8Array(nb);
     const chromaOf = (a, b) => {
       const v = new Float32Array(12);
       const fa = frameOfSample(F, a), fb = Math.max(fa + 1, frameOfSample(F, b));
       for (let f = fa; f < fb; f++) for (let c = 0; c < 12; c++) v[c] += F.chroma[f * 12 + c];
       return v;
     };
-    let prevC = null;
+    const rmsAt = (a, b) => {
+      const fa = frameOfSample(F, a), fb = Math.max(fa + 1, frameOfSample(F, b));
+      let e = 0;
+      for (let f = fa; f < fb; f++) e += Math.pow(10, F.rms[f] / 10);
+      return 10 * Math.log10(e / (fb - fa) + 1e-10);
+    };
+    let prevC = null, prevE = null;
     for (let i = 0; i < nb; i++) {
       const f = frameOfSample(F, beats[i]);
       let m = 0;
       for (let k = -1; k <= 1; k++) { const j = f + k; if (j >= 0 && j < F.nFrames) m = Math.max(m, F.lowOnset[j]); }
       low[i] = m;
-      const c = chromaOf(beats[i], i + 1 < nb ? beats[i + 1] : beats[i] + (beats[i] - beats[i - 1]));
+      const next = i + 1 < nb ? beats[i + 1] : beats[i] + (beats[i] - beats[Math.max(0, i - 1)]);
+      const c = chromaOf(beats[i], next), e = rmsAt(beats[i], next);
       chg[i] = prevC ? 1 - cosine(prevC, c) : 0;
-      prevC = c;
+      eng[i] = prevE != null ? e - prevE : 0;
+      active[i] = e > -55 ? 1 : 0;
+      prevC = c; prevE = e;
     }
-    const z = (a) => { const m = mean(a), s = std(a) || 1; return Array.from(a, (v) => (v - m) / s); };
-    const zl = z(low), zc = z(chg);
-    let best = -Infinity, phase = 0;
-    for (let p = 0; p < beatsPerBar; p++) {
-      let s = 0, c = 0;
-      for (let i = p; i < nb; i += beatsPerBar) { s += zl[i] + zc[i]; c++; }
-      s /= Math.max(1, c);
-      if (s > best) { best = s; phase = p; }
+    return { low, chg, eng, active };
+  }
+
+  /**
+   * 拍号 + 强拍相位。对候选每小节拍数 k 和相位 p，比较「强拍位置」与其余位置的特征差（对比度）；
+   * 4 拍是默认，3 / 2 / 6 需要明显更好才会被选中。
+   * 不提供 8：8 小节的乐句结构会让「隔一小节」的对比度虚高，容易把 4/4 误判成 8 拍。
+   * fixed：外部指定拍号时只选相位。
+   */
+  function analyzeMetre(F, beats, fixed, bpm) {
+    const nb = beats.length;
+    const res = { beatsPerBar: fixed || 4, phase: 0, scores: {} };
+    if (nb < 16) return res;
+    const nv = beatSyncNovelty(F, beats);
+    const idx = [];
+    for (let i = 0; i < nb; i++) if (nv.active[i]) idx.push(i);
+    const z = (a) => {
+      const v = idx.map((i) => a[i]);
+      const m = mean(v), s = std(v) || 1;
+      return (x) => (x - m) / s;
+    };
+    const zl = z(nv.low), zc = z(nv.chg), ze = z(nv.eng);
+    const N = new Float32Array(nb);
+    for (let i = 0; i < nb; i++) N[i] = nv.active[i] ? zl(nv.low[i]) + zc(nv.chg[i]) + 0.5 * ze(nv.eng[i]) : 0;
+    const contrast = (k) => {
+      let best = -Infinity, bp = 0;
+      for (let p = 0; p < k; p++) {
+        let s = 0, c = 0, o = 0, oc = 0;
+        for (const i of idx) { if (i % k === p) { s += N[i]; c++; } else { o += N[i]; oc++; } }
+        if (c < 4 || !oc) continue;
+        const d = s / c - o / oc;
+        if (d > best) { best = d; bp = p; }
+      }
+      return { d: best, p: bp };
+    };
+    const ks = fixed ? [fixed] : [2, 3, 4, 6];
+    const sc = {};
+    for (const k of ks) sc[k] = contrast(k);
+    let k = fixed || 4;
+    if (!fixed) {
+      const d4 = sc[4].d;
+      let best = 4, bd = d4;
+      // 偏向 4：其它拍号需要超出一定倍数
+      const need = { 2: 1.25, 3: 1.15, 6: 1.35 };
+      for (const kk of [3, 2, 6]) {
+        if (sc[kk].d > bd * need[kk] && sc[kk].d > 0.2) { best = kk; bd = sc[kk].d; }
+      }
+      k = best;
     }
-    return phase;
+    for (const kk of ks) res.scores[kk] = sc[kk].d;
+    res.beatsPerBar = k;
+    res.phase = sc[k].p;
+    return res;
   }
 
   /** 每小节的特征向量：12 维 chroma + 12 维音色（对数频带 DCT）+ 响度 */
@@ -630,18 +802,20 @@ function HRAnalysisModule() {
    */
   function analyze(mono, sr, opts = {}, progress = null) {
     const length = mono.length;
-    const beatsPerBar = opts.beatsPerBar || 4;
     progress && progress(0.02, '准备');
     const F = computeFrameFeatures(mono, sr, progress);
     progress && progress(0.52, '估计速度');
     let bpm = opts.bpmHint || estimateTempo(F.onset, F.fps);
-    const tb = trackBeats(F.onset, F.fps, bpm);
-    progress && progress(0.62, '节拍对齐');
-    const rawBeats = tb.beats.map((f) => F.frameToSample(f));
     const fine = fineOnsetEnvelope(mono, sr);
     let beats, grid = null, constantTempo = false;
-    const fit = fitConstantGrid(rawBeats);
-    if (fit && fit.residualStd < fit.period * 0.06) {
+    // 先试整首歌一条恒速网格（共用一个相位），再用高分辨率起音包络回归出精确周期，并检验是否真的恒速
+    const toSample = (t) => (t * F.hop + F.nfft / 2 - F.hop / 2) * F.decim;
+    const gg = searchGlobalGrid(F.onset, F.fps, bpm);
+    const coarse = gridBeats(toSample(gg.ph), gg.L * F.hop * F.decim, length);
+    let fit = fitConstantGrid(refineBeatsToOnsets(coarse, fine, sr * 0.03));
+    if (fit && !(verifyGrid(gridBeats(fit.t0, fit.period, length), fine, sr).ok && fit.residualStd < fit.period * 0.06)) fit = null;
+    progress && progress(0.62, '节拍对齐');
+    if (fit) {
       grid = refineGridPhase(fit, fine, length);
       // 采样级精修：用 ~0.7ms 分辨率的包络找到每拍真实起音，再对强拍做一次回归
       const fine2 = fineOnsetEnvelope(mono, sr, 0.0007);
@@ -662,11 +836,15 @@ function HRAnalysisModule() {
       constantTempo = true;
       bpm = 60 * sr / grid.period;
     } else {
+      // 速度漂移 / 变速：用随时间变化的期望拍长做动态规划
+      const tb = trackBeats(F.onset, F.fps, localPeriods(F.onset, F.fps, bpm));
+      const rawBeats = tb.beats.map((f) => F.frameToSample(f));
       beats = refineBeatsToOnsets(rawBeats, fine, sr * 0.015);
       if (beats.length > 1) bpm = 60 * sr / median(beats.slice(1).map((b, i) => b - beats[i]));
     }
     progress && progress(0.7, '识别小节');
-    const phase = chooseDownbeatPhase(F, beats, beatsPerBar);
+    const metre = analyzeMetre(F, beats, opts.beatsPerBar, bpm);
+    const beatsPerBar = metre.beatsPerBar, phase = metre.phase;
     const downbeats = [];
     for (let i = phase; i < beats.length; i += beatsPerBar) downbeats.push(beats[i]);
     // 小节序列：从 0 开始（补一个 0 号伪小节以覆盖前奏前的空白）
@@ -690,7 +868,7 @@ function HRAnalysisModule() {
     return {
       sampleRate: sr, length, bpm, constantTempo,
       grid: grid ? { t0: grid.t0, period: grid.period } : null,
-      beats, downbeats, beatsPerBar, bars,
+      beats, downbeats, beatsPerBar, bars, metreScores: metre.scores,
       barFeats: bf.feats, barEnergy: bf.energy,
       sections, markers, loopsTrack, loopsPost,
     };
@@ -698,7 +876,7 @@ function HRAnalysisModule() {
 
   return {
     analyze, deriveMarkers, findLoopCandidates, alignLoopEndToBars, gridBeats,
-    _internal: { fftInPlace, estimateTempo, trackBeats, fitConstantGrid, segmentBars, labelSegments },
+    _internal: { fftInPlace, computeFrameFeatures, tempoCandidates, estimateTempo, trackBeats, fitConstantGrid, segmentBars, labelSegments },
   };
 }
 

@@ -1,6 +1,6 @@
 // 评测：node tests/eval.js synth <合成歌曲目录> [--analysis web/analysis.js] [--json out.json]
 //       node tests/eval.js real  <Salsa 目录（tests/fetch_real_data.py 的输出）> [同上]
-// 指标：速度准确率（acc1 / acc2）、节拍 F（70ms）、强拍 F、拍号、副歌起点误差（小节）、循环接缝（dB，越小越好）。
+// 指标：速度准确率（acc1 / acc2）、节拍 F（70ms）、强拍 F、小节长度是否正确、副歌起点误差（小节）、循环接缝（dB，越小越好）。
 const fs = require('fs');
 const path = require('path');
 
@@ -91,7 +91,7 @@ if (mode === 'synth') {
       name: truth.name, ms, bpm: r.bpm, truthBpm: truth.bpm, bpb: r.beatsPerBar, truthBpb: truth.beatsPerBar,
       acc1: tempoAcc1(r.bpm, truth.bpm), acc2: tempoAcc2(r.bpm, truth.bpm),
       beatF: fMeasure(r.beats, tb, win), downF: fMeasure(r.downbeats, truth.downbeats, win),
-      metre: r.beatsPerBar === truth.beatsPerBar,
+      metre: Math.abs(r.beatsPerBar * (r.constantTempo && r.grid ? r.grid.period : 60 * sr / r.bpm) / (truth.beatsPerBar * 60 * sr / truth.bpm) - 1) < 0.05,
     };
     const dc = chorusStarts(r.sections);
     if (truth.choruses.length) {
