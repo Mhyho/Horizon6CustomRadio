@@ -74,6 +74,14 @@ function seamDb(x, start, end, N = 4800) {
   return 10 * Math.log10(0.5 * (pre + post) + 1e-12);
 }
 
+/** 低通（滑动平均 ≈ 0.5kHz 以下，主要是鼓点 / 贝斯的相位）后的接缝残差 */
+function lowpass(x, w = 96) {
+  const out = new Float32Array(x.length);
+  let acc = 0;
+  for (let i = 0; i < x.length; i++) { acc += x[i]; if (i >= w) acc -= x[i - w]; out[i] = acc / w; }
+  return out;
+}
+
 function mean(a) { return a.length ? a.reduce((s, v) => s + v, 0) / a.length : NaN; }
 
 const rows = [];
@@ -106,10 +114,9 @@ if (mode === 'synth') {
       const c = r.loopsTrack[0];
       row.seamDb = seamDb(mono, c.start, c.end);
       row.seamBars = c.bars;
-      // 音乐上是否合理：起点落在真实小节线上、长度是整数小节
-      const nearBar = truth.downbeats.some((d) => Math.abs(d - c.start) < 0.06 * sr);
-      const lenBars = (c.end - c.start) / barLen;
-      row.loopMusical = nearBar && Math.abs(lenBars - Math.round(lenBars)) < 0.06 * sr / barLen;
+      // 音乐上是否合理：起点、终点都落在真实小节线（±60ms）上，即循环长度是整数个真实小节
+      const nearBar = (p) => truth.downbeats.some((d) => Math.abs(d - p) < 0.06 * sr);
+      row.loopMusical = nearBar(c.start) && nearBar(c.end);
       row.seamClean = row.seamDb != null && row.seamDb < -20;
     }
     if (truth.loops.length) row.truthSeamDb = seamDb(mono, truth.loops[0].start, truth.loops[0].end);
@@ -157,12 +164,20 @@ if (mode === 'synth') {
     }
     rows.push({
       name: id, ms, bpm: r.bpm, truthBpm: bpmRef, acc1: tempoAcc1(r.bpm, bpmRef), acc2: tempoAcc2(r.bpm, bpmRef),
-      beatF: phaseFreeF, constant: r.constantTempo,
+      beatF: phaseFreeF, constant: r.constant === undefined ? r.constantTempo : r.constantTempo,
+      // 真实音乐没有「已知无缝循环」真值，只能看与分析器无关的波形残差（越低越好）；30 秒片段里用赛后循环候选（≥4 小节）
+      seamDb: r.loopsPost && r.loopsPost.length ? seamDb(mono, r.loopsPost[0].start, r.loopsPost[0].end, 2400) : null,
+      seamLowDb: r.loopsPost && r.loopsPost.length ? seamDb(lowpass(mono), r.loopsPost[0].start, r.loopsPost[0].end, 2400) : null,
     });
   }
   const summary = {
     n: rows.length, tempoAcc1: mean(rows.map((r) => +r.acc1)), tempoAcc2: mean(rows.map((r) => +r.acc2)),
     beatF: mean(rows.map((r) => r.beatF)), maxMs: Math.max(...rows.map((r) => r.ms)),
+    loopTop1SeamMedianDb: (() => { const a = rows.map((r) => r.seamDb).filter((v) => v != null).sort((x, y) => x - y); return a[a.length >> 1]; })(),
+    loopTop1SeamMeanDb: mean(rows.map((r) => r.seamDb).filter((v) => v != null)),
+    loopTop1LowpassMedianDb: (() => { const a = rows.map((r) => r.seamLowDb).filter((v) => v != null).sort((x, y) => x - y); return a[a.length >> 1]; })(),
+    loopTop1Below6dB: mean(rows.filter((r) => r.seamDb != null).map((r) => +(r.seamDb < -6))),
+    loopClipsWithCandidate: rows.filter((r) => r.seamDb != null).length,
   };
   if (args.includes('--verbose')) for (const r of rows) console.log(r.name.padStart(4), r.bpm.toFixed(1).padStart(6), '/', r.truthBpm.toFixed(1).padStart(6), r.acc1 ? 'Y' : '.', r.acc2 ? 'Y' : '.', r.beatF.toFixed(2), r.constant ? 'const' : 'var');
   console.log('SUMMARY', JSON.stringify(summary));

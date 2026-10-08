@@ -610,12 +610,43 @@
     const bars = song.analysis && song.analysis.downbeats;
     const mk = HR.deriveMarkers(song.sections, song.length, bars);
     pushUndo();
-    for (const k of MAIN_SIX) if (isNum(mk[k])) song.markers[k] = snapZeroOnly(mk[k]);
+    applyMarkerSet(song, mk);
     changed();
     toast('已根据段落生成 TrackDrop / Loop / PostDrop 标记');
   }
 
   function snapZeroOnly(s) { return state.snapZero && state.cur.mono ? zeroCross(s) : Math.round(s); }
+
+  // 循环起止点成对吸附到过零点：整体平移，保持循环长度不变（分别吸附会把波形级微调出来的精确长度破坏掉）
+  function snapLoopPair(start, end) {
+    const song = state.cur;
+    const s0 = Math.round(start), len = Math.round(end) - s0;
+    if (!state.snapZero || !song.mono) return [s0, s0 + len];
+    const m = song.mono, maxD = Math.round(song.sr * 0.002);
+    let best = 0, bc = Infinity;
+    for (let d = -maxD; d <= maxD; d++) {
+      const a = s0 + d, b = a + len;
+      if (a <= 0 || b >= m.length) continue;
+      // 起点、终点处的采样值都接近零，且斜率方向一致
+      const cost = Math.abs(m[a]) + Math.abs(m[b]) + (Math.sign(m[a] - m[a - 1]) === Math.sign(m[b] - m[b - 1]) ? 0 : 0.01) + 1e-5 * Math.abs(d);
+      if (cost < bc) { bc = cost; best = d; }
+    }
+    return [s0 + best, s0 + best + len];
+  }
+
+  /** 把一组推导出的 Marker 写进当前歌曲；两对循环点用成对吸附 */
+  function applyMarkerSet(song, mk) {
+    for (const k of MAIN_SIX) if (isNum(mk[k])) song.markers[k] = snapZeroOnly(mk[k]);
+    for (const kind of ['TrackLoop', 'PostRaceLoop']) {
+      const a = kind + 'Start', b = kind + 'End';
+      if (isNum(mk[a]) && isNum(mk[b]) && mk[b] > mk[a]) {
+        [song.markers[a], song.markers[b]] = snapLoopPair(mk[a], mk[b]);
+        // Drop 和对应的循环起点本来是同一个位置，吸附后也保持一致
+        const drop = kind === 'TrackLoop' ? 'TrackDrop' : 'PostDrop';
+        if (mk[drop] === mk[a]) song.markers[drop] = song.markers[a];
+      }
+    }
+  }
 
   // ------------------------------------------------------------------ 绘制
   function resizeCanvas(c, ctx) {
@@ -1378,15 +1409,19 @@
       if (!isNum(m[a]) || !isNum(m[b])) return;
       if (m[b] <= m[a]) { out.push(['err', `${label}：终点必须在起点之后`]); return; }
       const len = m[b] - m[a];
+      const sm = song.mono ? HR.seamScore(song.mono, sr, m[a], m[b]) : null;
+      const seamTxt = sm ? `，接缝 ${sm.db.toFixed(0)}dB` : '';
       if (len < sr * 4) out.push(['warn', `${label}只有 ${(len / sr).toFixed(1)} 秒，太短会显得很重复`]);
       const db = song.analysis && song.analysis.downbeats;
       if (db && db.length > 2) {
         const bar = (db[db.length - 1] - db[0]) / (db.length - 1);
         const bars = len / bar;
         const off = Math.abs(bars - Math.round(bars)) * bar / sr * 1000;
-        if (off > 15) out.push(['warn', `${label}长度为 ${bars.toFixed(2)} 小节，不是整小节，跳转时可能会掉拍（偏差 ${off.toFixed(0)}ms）`]);
-        else out.push(['ok', `${label}：${fmtTime(len, sr)}，${Math.round(bars)} 小节`]);
-      } else out.push(['ok', `${label}：${fmtTime(len, sr)}`]);
+        // 终点按波形微调过时长度会略偏离整小节；接缝好就不再提示
+        if (off > 15 && !(sm && sm.score >= 0.7)) out.push(['warn', `${label}长度为 ${bars.toFixed(2)} 小节，不是整小节，跳转时可能会掉拍（偏差 ${off.toFixed(0)}ms）`]);
+        else out.push(['ok', `${label}：${fmtTime(len, sr)}，${Math.round(bars)} 小节${seamTxt}`]);
+      } else out.push(['ok', `${label}：${fmtTime(len, sr)}${seamTxt}`]);
+      if (sm && sm.score < 0.35) out.push(['warn', `${label}接缝波形 / 响度差异大（${sm.db.toFixed(0)}dB），跳转处可能听到咔哒声或电平突变，可试试「循环点候选」`]);
     };
     loopCheck('TrackLoopStart', 'TrackLoopEnd', 'TrackLoop');
     loopCheck('PostRaceLoopStart', 'PostRaceLoopEnd', '赛后循环');
@@ -1504,7 +1539,7 @@ onmessage=(e)=>{const d=e.data;try{const r=M.analyze(d.mono,d.sr,d.opts,(p,msg)=
     btn.disabled = true;
     setProgress(0, '开始');
     try {
-      const r = await runAnalysis(song, { beatsPerBar: 4 });
+      const r = await runAnalysis(song, {});
       applyAnalysis(song, r, { replaceSections: $('optReplaceSections').checked, applyMarkers: $('optApplyMarkers').checked });
       toast(`识别完成：${r.bpm.toFixed(2)} BPM，${r.sections.length} 个段落`);
     } catch (e) {
@@ -1527,7 +1562,7 @@ onmessage=(e)=>{const d=e.data;try{const r=M.analyze(d.mono,d.sr,d.opts,(p,msg)=
     if (opts.replaceSections && r.sections && r.sections.length) song.sections = normalizeSections(r.sections, song.length);
     if (opts.applyMarkers) {
       const mk = r.markers && Object.keys(r.markers).length ? r.markers : HR.deriveMarkers(song.sections, song.length, song.analysis.downbeats);
-      for (const k of MAIN_SIX) if (isNum(mk[k])) song.markers[k] = snapZeroOnly(mk[k]);
+      applyMarkerSet(song, mk);
     }
     renderAnalysisResult();
     renderLoopCandidates(song.analysis.loopsTrack, 'TrackLoop');
@@ -1542,7 +1577,7 @@ onmessage=(e)=>{const d=e.data;try{const r=M.analyze(d.mono,d.sr,d.opts,(p,msg)=
     const counts = {};
     for (const s of song.sections) counts[s.label] = (counts[s.label] || 0) + 1;
     box.innerHTML = `速度 <b>${a.bpm.toFixed(2)} BPM</b>${a.constantTempo ? '（恒定速度网格）' : '（变速，逐拍跟踪）'}<br>
-      ${a.beats.length} 拍 / ${a.downbeats.length} 小节<br>
+      ${a.beats.length} 拍 / ${a.downbeats.length} 小节（每小节 ${a.beatsPerBar || 4} 拍，自动检测）<br>
       段落：${Object.entries(counts).map(([k, n]) => `${SECTION_TYPES[k].zh}×${n}`).join('、')}`;
   }
 
@@ -1556,7 +1591,7 @@ onmessage=(e)=>{const d=e.data;try{const r=M.analyze(d.mono,d.sr,d.opts,(p,msg)=
       : { start: m.PostRaceLoopStart, end: m.PostRaceLoopEnd };
     const list = HR.findLoopCandidates(a.barFeats, a.featBars, song.length,
       { start: isNum(pre.start) ? pre.start : null, end: isNum(pre.end) ? pre.end : null },
-      { minBars: kind === 'TrackLoop' ? 8 : 4, count: 8 });
+      { minBars: kind === 'TrackLoop' ? 8 : 4, count: 8, audio: song.mono, sr: song.sr });
     renderLoopCandidates(list, kind);
   }
 
@@ -1573,14 +1608,13 @@ onmessage=(e)=>{const d=e.data;try{const r=M.analyze(d.mono,d.sr,d.opts,(p,msg)=
       const it = document.createElement('div');
       it.className = 'loop-item';
       it.innerHTML = `<span class="tm">${fmtTime(c.start, song.sr)} → ${fmtTime(c.end, song.sr)}</span>
-        <span class="sc">${c.bars} 小节</span>
+        <span class="sc" title="${c.seam != null ? '接缝评分 ' + Math.round(c.seam * 100) + '/100；终点已按波形微调 ' + (c.shift || 0) + ' 采样点' : ''}">${c.bars} 小节${c.seamDb != null ? ' · 接缝 ' + c.seamDb.toFixed(0) + 'dB' : ''}</span>
         <button class="btn small" data-a="try" title="试听跳转衔接">▶</button>
         <button class="btn small" data-a="use">应用</button>`;
       it.querySelector('[data-a=try]').onclick = () => previewLoop(c.start, c.end);
       it.querySelector('[data-a=use]').onclick = () => {
         pushUndo();
-        song.markers[kind + 'Start'] = snapZeroOnly(c.start);
-        song.markers[kind + 'End'] = snapZeroOnly(c.end);
+        [song.markers[kind + 'Start'], song.markers[kind + 'End']] = snapLoopPair(c.start, c.end);
         changed({ keepSections: true });
         toast(`已应用 ${kind}`);
       };

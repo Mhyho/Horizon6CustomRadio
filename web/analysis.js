@@ -866,15 +866,162 @@ function HRAnalysisModule() {
     return Math.min(length - 1, best);
   }
 
+  // ---------------------------------------------------------------- 循环接缝
+  // 游戏从 TrackLoopEnd 硬跳回 TrackLoopStart，没有交叉淡化，所以要在波形层面评估接缝：
+  // 跳转前的音频（End 之前）应该像 Start 之前的音频，跳转后的音频（Start 之后）应该像 End 之后的音频。
+  const _dec = { src: null, x4: null };
+  function decimate4(x) {
+    if (_dec.src === x) return _dec.x4;
+    const n = x.length >> 2, y = new Float32Array(n);
+    for (let i = 0; i < n; i++) y[i] = 0.25 * (x[4 * i] + x[4 * i + 1] + x[4 * i + 2] + x[4 * i + 3]);
+    _dec.src = x; _dec.x4 = y;
+    return y;
+  }
+
+  function winEnergy(x, a, n) {
+    let e = 0;
+    for (let i = 0; i < n; i++) { const v = x[a + i] || 0; e += v * v; }
+    return e;
+  }
+
+  /** 两段窗口的残差比 (a-b)^2 / 平均能量；0 = 逐采样一致，2 = 互不相关，越小越好 */
+  function residualRatio(x, a, b, n) {
+    let d = 0, ea = 0, eb = 0;
+    for (let i = 0; i < n; i++) {
+      const p = x[a + i] || 0, q = x[b + i] || 0;
+      d += (p - q) * (p - q); ea += p * p; eb += q * q;
+    }
+    if (ea + eb < 1e-9 * n) return 0;   // 两边都是数字静音：天然无缝
+    return d / (0.5 * (ea + eb) + 1e-12);
+  }
+
+  function spectrumShape(x, a, frames) {
+    const nfft = 2048, NB = 20, out = new Float64Array(NB);
+    const re = new Float64Array(nfft), im = new Float64Array(nfft);
+    for (let fr = 0; fr < frames; fr++) {
+      const off = a + fr * nfft;
+      for (let i = 0; i < nfft; i++) { re[i] = (x[off + i] || 0) * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / nfft)); im[i] = 0; }
+      fftInPlace(re, im);
+      for (let k = 1; k < nfft / 2; k++) {
+        const b = Math.min(NB - 1, Math.floor(NB * Math.log(1 + k / 2) / Math.log(1 + nfft / 4)));
+        out[b] += re[k] * re[k] + im[k] * im[k];
+      }
+    }
+    for (let b = 0; b < NB; b++) out[b] = 10 * Math.log10(out[b] / frames + 1e-12);
+    return out;
+  }
+
+  /**
+   * 接缝评分（0~1，越高越好）：
+   *  match 跳转前 / 后 50ms 波形与「原位置」的残差；level 0.5s 响度差；spec 0.4s 频谱形状差；cont 跳转点的值与斜率连续性。
+   * 返回 {score, db(波形残差 dB，越低越好), match, level, spec, cont}
+   */
+  function seamScore(x, sr, start, end) {
+    const N = Math.round(0.05 * sr), L = Math.round(0.5 * sr), n = x.length;
+    start = Math.round(start); end = Math.round(end);
+    const canPre = start - N >= 0 && end - N >= 0;
+    const canPost = end + N <= n && start + N <= n;
+    if (!canPre && !canPost) return { score: 0, db: 3, match: 0, level: 0, spec: 0, cont: 0 };
+    let r = 0, c = 0;
+    if (canPre) { r += residualRatio(x, start - N, end - N, N); c++; }
+    if (canPost) { r += residualRatio(x, start, end, N); c++; }
+    r /= c;
+    const db = 10 * Math.log10(r + 1e-9);
+    const match = Math.max(0, Math.min(1, (3 - db) / 33));
+
+    const rmsDb = (a, len) => 10 * Math.log10(winEnergy(x, Math.max(0, a), Math.min(len, n - Math.max(0, a))) / Math.max(1, len) + 1e-10);
+    let ld = 0, lc = 0;
+    if (start - L >= 0 && end - L >= 0) { ld += Math.abs(rmsDb(start - L, L) - rmsDb(end - L, L)); lc++; }
+    if (end + L <= n) { ld += Math.abs(rmsDb(start, L) - rmsDb(end, L)); lc++; }
+    const level = lc ? Math.exp(-0.5 * Math.pow(ld / lc / 3, 2)) : 0.5;
+
+    let sd = 0, sc = 0;
+    const S = 2048 * 4;
+    if (start - S >= 0 && end - S >= 0) {
+      const a = spectrumShape(x, start - S, 4), b = spectrumShape(x, end - S, 4);
+      let d = 0; for (let k = 0; k < a.length; k++) d += Math.abs(a[k] - b[k]);
+      sd += d / a.length; sc++;
+    }
+    if (end + S <= n) {
+      const a = spectrumShape(x, start, 4), b = spectrumShape(x, end, 4);
+      let d = 0; for (let k = 0; k < a.length; k++) d += Math.abs(a[k] - b[k]);
+      sd += d / a.length; sc++;
+    }
+    const spec = sc ? Math.max(0, 1 - sd / sc / 15) : 0.5;
+
+    // 跳转点连续性：…x[e-2], x[e-1] | x[s], x[s+1]…；数值与斜率相对局部一阶差分幅度
+    let cont = 0.5;
+    if (end >= 3 && start >= 3 && start + 2 < n) {
+      let dsum = 0, dc = 0;
+      for (let i = -48; i < 48; i++) { const p = start + i; if (p > 0 && p < n) { dsum += Math.abs(x[p] - x[p - 1]); dc++; } }
+      const norm = dsum / Math.max(1, dc) + 1e-5;
+      const jump = Math.abs(x[start] - x[end - 1]);
+      const slope = Math.abs((x[start + 1] - x[start]) - (x[end - 1] - x[end - 2]));
+      cont = Math.exp(-(0.5 * jump / norm + 0.25 * slope / norm));
+    }
+    const score = 0.5 * match + 0.15 * level + 0.2 * spec + 0.15 * cont;
+    return { score, db, match, level, spec, cont };
+  }
+
+  /** 降采样域里的归一化互相关粗搜：返回 End 在 ±M（降采样点）内的最佳偏移和相关系数 */
+  function coarseShift(x4, s4, e4, M, N4, step) {
+    const corr = (a, b) => {
+      let d = 0, ea = 0, eb = 0;
+      for (let i = 0; i < N4; i++) { const p = x4[a + i] || 0, q = x4[b + i] || 0; d += p * q; ea += p * p; eb += q * q; }
+      return ea > 1e-9 && eb > 1e-9 ? d / Math.sqrt(ea * eb) : 0;
+    };
+    const usePre = s4 - N4 >= 0 && e4 - N4 - M >= 0;
+    const usePost = e4 + M + N4 <= x4.length && s4 + N4 <= x4.length;
+    let best = -Infinity, bd = 0, bc = 0;
+    if (!usePre && !usePost) return { d: 0, c: 0 };
+    for (let d = -M; d <= M; d += step) {
+      let c = 0, k = 0;
+      if (usePre) { c += corr(s4 - N4, e4 + d - N4); k++; }
+      if (usePost) { c += corr(s4, e4 + d); k++; }
+      c /= k;
+      const adj = c - 0.0003 * Math.abs(d);      // 同样好时偏向不动
+      if (adj > best) { best = adj; bd = d; bc = c; }
+    }
+    return { d: bd, c: bc };
+  }
+
+  /**
+   * 微调终点：在 ±maxShiftSec 内做互相关（先 4 倍降采样粗搜，再在原采样率上 ±6 采样精搜），
+   * 使「End 前 / 后」的波形与「Start 前 / 后」最吻合，让循环长度精确而不是取整到小节线。
+   * 起点不动。返回 {end, shift, seam}
+   */
+  function refineLoopEnd(x, sr, start, end, maxShiftSec = 0.03) {
+    start = Math.round(start); end = Math.round(end);
+    const x4 = decimate4(x);
+    const cs = coarseShift(x4, Math.round(start / 4), Math.round(end / 4), Math.round(maxShiftSec * sr / 4), Math.round(0.05 * sr / 4), 1);
+    const N = Math.round(0.05 * sr);
+    let bestE = end + cs.d * 4, bestR = Infinity;
+    for (let d = -6; d <= 6; d++) {
+      const e = end + cs.d * 4 + d;
+      let r = 0, k = 0;
+      if (start - N >= 0 && e - N >= 0) { r += residualRatio(x, start - N, e - N, N); k++; }
+      if (e + N <= x.length) { r += residualRatio(x, start, e, N); k++; }
+      if (!k) continue;
+      r /= k;
+      if (r < bestR - 1e-12) { bestR = r; bestE = e; }
+    }
+    return { end: bestE, shift: bestE - end, seam: seamScore(x, sr, start, bestE) };
+  }
+
   // ---------------------------------------------------------------- 循环候选
   /**
-   * 在小节起点上搜索「无缝」循环：跳转前后的内容与原位置相似。
+   * 在小节起点上搜索「无缝」循环：先用小节级特征（和声 + 音色）挑出音乐上合理的起止点，
+   * 再（提供了 opts.audio / opts.sr 时）对每个候选做波形级的终点微调和接缝评分，综合排序。
    * prefer: {start, end} 期望位置（采样点），用于偏好；minBars：最短循环小节数
+   * 返回 [{start, end, bars, score, music, seam, seamDb, shift, seconds}]
+   *   score = music + 2.0 * seam；seam 为 0~1，seamDb 为波形残差（dB，越低越好）；
+   *   end 已经过微调，所以长度不一定恰好是整小节（shift 为相对小节线的偏移，采样点）。
    */
   function findLoopCandidates(barFeats, bars, length, prefer, opts = {}) {
     const n = barFeats.length;
     const minBars = opts.minBars || 8;
     const w = opts.window || 2;
+    const audio = opts.audio || null, sr = opts.sr || 48000;
     const out = [];
     if (n < minBars + 2 * w) return out;
     const barLen = (bars[bars.length - 1] - bars[0]) / Math.max(1, bars.length - 1);
@@ -894,29 +1041,66 @@ function HRAnalysisModule() {
       }
       return c ? s / c : 0;
     };
+    const musicScore = (i, j) => {
+      let s = 0.5 * winSim(i, j, true) + 0.5 * winSim(i, j, false);
+      const len = j - i;
+      if (len % 8 === 0) s += 0.06; else if (len % 4 === 0) s += 0.03;
+      if (ps != null) s -= 0.012 * Math.abs(i - ps);
+      if (pe != null) s -= 0.012 * Math.abs(j - pe);
+      s += 0.002 * Math.min(len, 64);
+      return s;
+    };
     for (let i = w; i < n; i++) {
       for (let j = i + minBars; j <= n - 1; j++) {
         if (bars[j] >= length) break;
-        let s = 0.5 * winSim(i, j, true) + 0.5 * winSim(i, j, false);
-        const len = j - i;
-        if (len % 8 === 0) s += 0.06; else if (len % 4 === 0) s += 0.03;
-        if (ps != null) s -= 0.012 * Math.abs(i - ps);
-        if (pe != null) s -= 0.012 * Math.abs(j - pe);
-        s += 0.002 * Math.min(len, 64);
-        out.push({ i, j, score: s });
+        out.push({ i, j, score: musicScore(i, j) });
       }
     }
     out.sort((a, b) => b.score - a.score);
+    const count = opts.count || 6;
+    // 第一级：音乐相似度前 600 个；第二级（有音频时）：用降采样波形做快速互相关筛到 24 个；第三级：完整接缝评分
     const picked = [];
-    for (const c of out) {
-      if (picked.length >= (opts.count || 6)) break;
-      if (picked.some((p) => Math.abs(p.i - c.i) < 2 && Math.abs(p.j - c.j) < 2)) continue;
-      picked.push(c);
+    const dup = (c) => picked.some((p) => Math.abs(p.i - c.i) < 2 && Math.abs(p.j - c.j) < 2);
+    if (audio) {
+      const x4 = decimate4(audio), tier1 = out.slice(0, 600);
+      const N4 = Math.round(0.025 * sr / 4), M2 = Math.round(0.015 * sr / 4);
+      if (ps != null && pe != null && pe - ps >= minBars && ps >= w) tier1.push({ i: ps, j: pe, score: musicScore(ps, pe) });
+      for (const c of tier1) c.q = c.score + coarseShift(x4, Math.round(bars[c.i] / 4), Math.round(bars[c.j] / 4), M2, N4, 2).c;
+      tier1.sort((a, b) => b.q - a.q);
+      const keep = Math.max(count * 4, 24);
+      if (ps != null && pe != null) { const pc = tier1.find((c) => c.i === ps && c.j === pe); if (pc) picked.push(pc); }
+      for (const c of tier1) {
+        if (picked.length >= keep) break;
+        if (!dup(c)) picked.push(c);
+      }
+    } else {
+      for (const c of out) {
+        if (picked.length >= count) break;
+        if (!dup(c)) picked.push(c);
+      }
     }
-    return picked.map((c) => ({
-      start: bars[c.i], end: Math.min(length - 1, bars[c.j]), bars: c.j - c.i,
-      score: c.score, seconds: (bars[c.j] - bars[c.i]) / (barLen || 1),
-    }));
+    let res = picked.map((c) => {
+      const start = bars[c.i];
+      let end = Math.min(length - 1, bars[c.j]);
+      const r = { start, end, bars: c.j - c.i, music: c.score, score: c.score, seam: null, seamDb: null, shift: 0, i: c.i, j: c.j };
+      if (audio) {
+        const ref = refineLoopEnd(audio, sr, start, end);
+        r.end = Math.min(length - 1, ref.end);
+        r.shift = r.end - end;
+        r.seam = ref.seam.score; r.seamDb = ref.seam.db;
+        r.score = c.score + 2.0 * ref.seam.score;
+      }
+      r.seconds = (r.end - r.start) / sr;
+      return r;
+    });
+    res.sort((a, b) => b.score - a.score);
+    const fin = [];
+    for (const c of res) {
+      if (fin.length >= count) break;
+      if (fin.some((p) => Math.abs(p.i - c.i) < 2 && Math.abs(p.j - c.j) < 2)) continue;
+      fin.push(c);
+    }
+    return fin.map(({ i, j, ...rest }) => rest);
   }
 
   // ---------------------------------------------------------------- 主流程
@@ -987,20 +1171,30 @@ function HRAnalysisModule() {
       energy: s.energy,
     }));
     const markers = deriveMarkers(sections, length, bars);
-    const loopsTrack = findLoopCandidates(bf.feats, bars, length, { start: markers.TrackLoopStart, end: markers.TrackLoopEnd });
-    const loopsPost = findLoopCandidates(bf.feats, bars, length, { start: markers.PostRaceLoopStart, end: markers.PostRaceLoopEnd }, { minBars: 4 });
+    progress && progress(0.94, '循环接缝');
+    const loopsTrack = findLoopCandidates(bf.feats, bars, length, { start: markers.TrackLoopStart, end: markers.TrackLoopEnd }, { audio: mono, sr });
+    const loopsPost = findLoopCandidates(bf.feats, bars, length, { start: markers.PostRaceLoopStart, end: markers.PostRaceLoopEnd }, { minBars: 4, audio: mono, sr });
+    // 标记的终点也做波形级微调，并给出接缝评分（起点不动；只接受明显改善的微调）
+    const markerSeam = {};
+    for (const [kind, a, b] of [['TrackLoop', 'TrackLoopStart', 'TrackLoopEnd'], ['PostRaceLoop', 'PostRaceLoopStart', 'PostRaceLoopEnd']]) {
+      if (markers[a] == null || markers[b] == null || markers[b] <= markers[a]) continue;
+      const before = seamScore(mono, sr, markers[a], markers[b]);
+      const ref = refineLoopEnd(mono, sr, markers[a], markers[b]);
+      if (ref.shift !== 0 && ref.seam.score > before.score + 0.03) { markers[b] = Math.min(length - 1, ref.end); markerSeam[kind] = ref.seam; }
+      else markerSeam[kind] = before;
+    }
     progress && progress(1, '完成');
     return {
       sampleRate: sr, length, bpm, constantTempo,
       grid: grid ? { t0: grid.t0, period: grid.period } : null,
       beats, downbeats, beatsPerBar, bars, metreScores: metre.scores, chordRatio: metre.chordRatio,
       barFeats: bf.feats, barEnergy: bf.energy,
-      sections, markers, loopsTrack, loopsPost,
+      sections, markers, loopsTrack, loopsPost, markerSeam,
     };
   }
 
   return {
-    analyze, deriveMarkers, findLoopCandidates, alignLoopEndToBars, gridBeats,
+    analyze, deriveMarkers, findLoopCandidates, alignLoopEndToBars, gridBeats, seamScore, refineLoopEnd,
     _internal: { fftInPlace, computeFrameFeatures, tempoCandidates, estimateTempo, trackBeats, fitConstantGrid, segmentBars, labelSegments },
   };
 }
